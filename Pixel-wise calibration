@@ -1,0 +1,138 @@
+%% Pixel-wise Calibration & Interactive ROI Analysis Tool
+% Author: Gemini AI Collaboration (for Wang Group)
+% Function: Calculate pixel-wise slope/R^2 and perform interactive ROI analysis.
+
+clear; clc; close all;
+
+%% 1. Load Image Sequence (.tif)
+folderPath = uigetdir('', 'Select the folder containing TIF images');
+if folderPath == 0, error('User cancelled folder selection'); end
+
+% Get list of tif files (sorted)
+tifFiles = dir(fullfile(folderPath, '*.tif'));
+numImages = length(tifFiles);
+if numImages == 0, error('No TIF files found in the directory'); end
+
+% Read first image for dimensions
+firstImg = imread(fullfile(folderPath, tifFiles(1).name));
+[rows, cols] = size(firstImg);
+imageStack = zeros(rows, cols, numImages, 'double');
+
+fprintf('Loading %d images...\n', numImages);
+for i = 1:numImages
+    imageStack(:,:,i) = double(imread(fullfile(folderPath, tifFiles(i).name)));
+end
+
+%Pre-processing: 5x5 Spatial Smoothing
+% We apply an averaging filter to reduce noise in the spatial domain.
+fprintf('Applying 5x5 spatial smoothing filter...\n');
+h = fspecial('average', [5 5]); % Define 5x5 averaging kernel
+
+for i = 1:numImages
+    % 'replicate' prevents dark borders at the edges of the image
+    imageStack(:,:,i) = imfilter(imageStack(:,:,i), h, 'replicate');
+end
+
+%% 2. Load Concentration Values
+[excelFile, excelPath] = uigetfile({'*.xlsx';'*.csv';'*.txt'}, 'Select Concentration File');
+if excelFile == 0, error('User cancelled file selection'); end
+
+concentrations = readmatrix(fullfile(excelPath, excelFile));
+concentrations = concentrations(~isnan(concentrations)); % Clean NaNs
+concentrations = concentrations(:); % Force column vector
+
+% Validation
+if numImages ~= length(concentrations)
+    error('Mismatch: %d images vs %d concentrations.', numImages, length(concentrations));
+end
+
+%% 3. Calculate Slope & R^2 (Vectorized)
+fprintf('Processing calibration curves per pixel (Vectorized Engine)...\n');
+pixelData = reshape(imageStack, [], numImages)'; % [Time x Pixels]
+X = [ones(length(concentrations), 1), concentrations];
+
+% Solve Linear Regression: B = [Intercept; Slope]
+B = X \ pixelData; 
+slopeMap = reshape(B(2,:), [rows, cols]);
+
+% Calculate R^2
+yFit = X * B;
+yMean = mean(pixelData, 1);
+SStot = sum((pixelData - yMean).^2, 1);
+SSres = sum((pixelData - yFit).^2, 1);
+R2 = 1 - (SSres ./ SStot);
+R2(SStot == 0) = 0; % Handle static/background pixels
+rSquaredMap = reshape(R2, [rows, cols]);
+
+%% 4. Plot Heatmaps & Set Data Ranges
+% --- USER SETTINGS: MANUALLY SET RANGES HERE ---
+% Default: 1st to 99th percentile for Slope to ignore noise.
+slopeRange = [prctile(slopeMap(:), 1), prctile(slopeMap(:), 99)]; 
+r2Range    = [0.8, 1.0]; % Focus on the high-linearity region
+% -----------------------------------------------
+
+fig = figure('Color', 'w', 'Position', [100, 100, 1200, 600], 'Name', 'Calibration Report');
+
+% --- Plot Slope Map ---
+ax1 = subplot(1,2,1);
+imagesc(slopeMap);
+colorbar; axis image;
+clim(slopeRange);
+colormap(ax1, parula);
+title(sprintf('Slope Heatmap (Sensitivity)\nRange: [%.2f, %.2f]', slopeRange(1), slopeRange(2)));
+
+% --- Plot R^2 Map ---
+ax2 = subplot(1,2,2);
+imagesc(rSquaredMap);
+colorbar; axis image;
+clim(r2Range);
+colormap(ax2, hot);
+title(sprintf('R^2 Heatmap (Linearity)\nRange: [%.2f, %.2f]', r2Range(1), r2Range(2)));
+
+%% 5. Interactive ROI Selection with Redo Loop
+keepSelecting = true;
+
+while keepSelecting
+    fprintf('\nACTION: Use the mouse to draw a polygon on the SLOPE MAP.\n');
+    fprintf('Click to add vertices. Double-click the last point to close.\n');
+    
+    % Ensure drawing happens on the Slope Map axis
+    axes(ax1); 
+    roi = drawpolygon('Color', 'c', 'LineWidth', 2, 'Label', 'Target');
+    
+    % Create Mask and Calculate Statistics
+    mask = createMask(roi);
+    roiSlopes = slopeMap(mask);
+    
+    roiMean = mean(roiSlopes, 'omitnan');
+    roiStd  = std(roiSlopes, 'omitnan');
+    numPix  = sum(mask(:));
+    
+    % Command Window Summary
+    fprintf('\n--- ROI Analysis ---\n');
+    fprintf('Pixels: %d | Mean Slope: %.4f | Std Dev: %.4f\n', numPix, roiMean, roiStd);
+    
+    % Prompt user to keep or redo
+    msg = sprintf('ROI Stats:\nMean: %.2f\nStd Dev: %.2f\n\nIs this selection okay?', roiMean, roiStd);
+    choice = questdlg(msg, 'Confirm ROI', 'Yes, Finalize', 'No, Redo', 'Yes, Finalize');
+    
+    if strcmp(choice, 'Yes, Finalize')
+        keepSelecting = false;
+    else
+        delete(roi); % Clear the graphic to try again
+        fprintf('ROI discarded. Resetting tool...\n');
+    end
+end
+
+%% 6. Finalize and Export
+% Add final stats text box to the image
+statsStr = sprintf('Final ROI Stats:\nMean: %.2f\nStd: %.2f\nPix: %d', roiMean, roiStd, numPix);
+text(ax1, 10, 30, statsStr, 'Color', 'cyan', 'FontSize', 10, ...
+    'FontWeight', 'bold', 'BackgroundColor', [0 0 0 0.6]);
+
+% Save the final visual report
+saveas(gcf, 'Calibration_Final_Report.png');
+
+% Optional: Save raw data to CSV
+writematrix(slopeMap, 'Slope_Data_Map.csv');
+fprintf('\nDONE: Report saved as "Calibration_Final_Report.png" and "Slope_Data_Map.csv"\n');
